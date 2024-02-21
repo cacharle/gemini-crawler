@@ -1,69 +1,79 @@
-// use tokio;
-// use tokio::net::TcpStream;
-// use tokio::io::AsyncWriteExt;
-// use tokio::io::AsyncReadExt;
-// use native_tls::TlsConnector;
-// use futures::stream::FuturesUnordered;
-// use futures::prelude::*;
+use tokio;
+use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncReadExt;
 
-use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+// use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+use native_tls::TlsConnector;
+
 use petgraph::dot::{Config, Dot};
 use petgraph::graph::{Graph, NodeIndex};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
 use std::io::prelude::*;
-use std::net::TcpStream;
+// use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use url::Url;
 
 type GeminiGraph = Graph<String, usize>;
 
 fn graph_add_node(
-    graph: &mut GeminiGraph,
-    url_node_ids: &mut HashMap<String, NodeIndex>,
+    graph: Rc<RefCell<GeminiGraph>>,
+    url_node_ids: Rc<RefCell<HashMap<String, NodeIndex>>>,
     url: &Url,
 ) -> NodeIndex {
     let key = format!("{}{}", url.domain().unwrap(), url.path());
-    if let Some(index) = url_node_ids.get(&key) {
+    if let Some(index) = url_node_ids.borrow().get(&key) {
         return *index;
     }
-    let index = graph.add_node(key.clone());
-    url_node_ids.insert(key, index);
+    let index = graph.borrow_mut().add_node(key.clone());
+    url_node_ids.borrow_mut().insert(key, index);
     index
 }
 
-fn visit_url_recursion(
+use std::cell::RefCell;
+use std::rc::Rc;
+use async_recursion::async_recursion;
+
+#[async_recursion(?Send)]
+async fn visit_url_recursion(
     base_url: Url,
     base_node_id: NodeIndex,
-    graph: &mut GeminiGraph,
-    visited: &mut HashSet<Url>,
-    url_node_ids: &mut HashMap<String, NodeIndex>,
+    graph: Rc<RefCell<GeminiGraph>>,
+    visited: Rc<RefCell<HashSet<Url>>>,
+    url_node_ids: Rc<RefCell<HashMap<String, NodeIndex>>>,
     depth: usize,
 ) -> Result<(), Box<dyn Error>> {
-    if depth == 0 || visited.contains(&base_url) {
+    if depth == 0 || visited.borrow().contains(&base_url) {
         return Ok(());
     }
     eprintln!("Visiting {}", base_url.to_string());
-    visited.insert(base_url.clone());
+    visited.borrow_mut().insert(base_url.clone());
     // Setup SSL
-    let mut connector_builder = SslConnector::builder(SslMethod::tls())?;
-    connector_builder.set_verify(SslVerifyMode::NONE);
-    let connector = connector_builder.build();
+
+    // let mut connector_builder = SslConnector::builder(SslMethod::tls())?;
+    // connector_builder.set_verify(SslVerifyMode::NONE);
+    // let connector = connector_builder.build();
+
     // Connect to base url and query the gemini page
     let base_domain = base_url.domain().unwrap();
     let base_domain_port = base_domain.to_owned() + ":1965";
-    let stream = TcpStream::connect(base_domain_port)?;
-    // let cx = TlsConnector::builder().build()?;
-    // let cx = tokio_native_tls::TlsConnector::from(cx);
-    // let mut stream = cx.connect(base_domain, stream).await?;
-    let mut stream = connector.connect(base_domain, stream)?;
-    stream.write_all((base_url.to_string() + "\r\n").as_bytes())?;
+    let stream = TcpStream::connect(base_domain_port).await?;
+    let cx = TlsConnector::builder().danger_accept_invalid_certs(true).build()?;
+    let cx = tokio_native_tls::TlsConnector::from(cx);
+    let mut stream = cx.connect(base_domain, stream).await?;
+    // let mut stream = connector.connect(base_domain, stream)?;
+    stream.write_all((base_url.to_string() + "\r\n").as_bytes()).await?;
     let mut response = String::new();
-    stream.read_to_string(&mut response)?; // TODO: check if response contains error
+    stream.read_to_string(&mut response).await?; // TODO: check if response contains error
                                            // Parse links in the response
 
-    response
+    use futures::stream::FuturesUnordered;
+    use futures::prelude::*;
+
+    let mut fs = response
         .lines()
         .filter_map(|line| {
             let line = line.strip_prefix("=>")?.trim().replace("\t", " ");
@@ -80,49 +90,53 @@ fn visit_url_recursion(
             }
         })
         .map(|adjacent_url| {
-            let node_id = graph_add_node(graph, url_node_ids, &adjacent_url);
+            let node_id = graph_add_node(graph.clone(), url_node_ids.clone(), &adjacent_url);
 
-            let edge_weight = match graph.find_edge(base_node_id, node_id) {
-                Some(e) => graph.edge_weight(e).unwrap() + 1,
+            let edge_weight = match graph.borrow().find_edge(base_node_id, node_id) {
+                Some(e) => graph.borrow().edge_weight(e).unwrap() + 1,
                 None => 1,
             };
-            graph.update_edge(base_node_id, node_id, edge_weight);
+            graph.borrow_mut().update_edge(base_node_id, node_id, edge_weight);
             visit_url_recursion(
                 adjacent_url,
                 node_id,
-                graph,
-                visited,
-                url_node_ids,
+                graph.clone(),
+                visited.clone(),
+                url_node_ids.clone(),
                 depth - 1,
             )
         })
-        .collect::<Result<(), _>>()
+        // .collect::<Result<(), _>>()
+        .collect::<FuturesUnordered<_>>();
+    while let Some(_res) = fs.next().await {
+    }
+    Ok(())
 }
 
-fn visit_url(base_url: Url, depth: usize) -> Result<GeminiGraph, Box<dyn Error>> {
-    let mut graph = Graph::new();
-    let mut visited = HashSet::new();
-    let mut url_node_ids = HashMap::new();
-    let base_node_id = graph_add_node(&mut graph, &mut url_node_ids, &base_url);
+async fn visit_url(base_url: Url, depth: usize) -> Result<Rc<RefCell<GeminiGraph>>, Box<dyn Error>> {
+    let graph = Rc::new(RefCell::new(Graph::new()));
+    let visited = Rc::new(RefCell::new(HashSet::new()));
+    let url_node_ids = Rc::new(RefCell::new(HashMap::new()));
+    let base_node_id = graph_add_node(graph.clone(), url_node_ids.clone(), &base_url);
     visit_url_recursion(
         base_url,
         base_node_id,
-        &mut graph,
-        &mut visited,
-        &mut url_node_ids,
+        graph.clone(),
+        visited,
+        url_node_ids,
         depth,
-    )?;
+    ).await?;
     Ok(graph)
 }
 
 const BASE_URL: &str = "gemini://makeworld.space:1965/amfora-wiki/";
-const DEPTH: usize = 3;
+const DEPTH: usize = 4;
 
-fn main() -> Result<(), Box<dyn Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
     let base_url = Url::parse(BASE_URL)?;
-    let graph = visit_url(base_url, DEPTH)?;
-    // FIXME: too many nodes compared to number of visited pages (~10 pages visited but got ~100
-    // nodes), more than one key is created for each pages during the recursion.
+    let graph = visit_url(base_url, DEPTH).await?;
+    let graph = graph.take(); // FIXME: understand why into_inner() doesn't work here
     println!("Node count: {}", graph.node_count());
     println!("Edge count: {}", graph.edge_count());
     // Piping dot representation of graph to graphviz and writing the output to an image
