@@ -1,0 +1,16 @@
+[package]
+name = "tokimini"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3.30"
+native-tls = "0.2.11"
+openssl = "0.10.64"
+petgraph = "0.6.4"
+tokio = { version = "1.36.0", features = ["full"] }
+tokio-native-tls = "0.3.1"
+tokio-stream = "0.1.14"
+url = "2.5.0"
