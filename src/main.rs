@@ -2,6 +2,7 @@ use tokio;
 use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
 use tokio::io::AsyncReadExt;
+use tokio::time::timeout;
 
 // use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
 
@@ -36,6 +37,9 @@ fn graph_add_node(
 use std::cell::RefCell;
 use std::rc::Rc;
 use async_recursion::async_recursion;
+use std::time::Duration;
+
+const TIMEOUT: Duration = Duration::from_secs(2);
 
 #[async_recursion(?Send)]
 async fn visit_url_recursion(
@@ -60,19 +64,20 @@ async fn visit_url_recursion(
     // Connect to base url and query the gemini page
     let base_domain = base_url.domain().unwrap();
     let base_domain_port = base_domain.to_owned() + ":1965";
-    let stream = TcpStream::connect(base_domain_port).await?;
+    let stream = timeout(TIMEOUT, TcpStream::connect(base_domain_port)).await??;
     let cx = TlsConnector::builder().danger_accept_invalid_certs(true).build()?;
     let cx = tokio_native_tls::TlsConnector::from(cx);
-    let mut stream = cx.connect(base_domain, stream).await?;
+    let mut stream = timeout(TIMEOUT, cx.connect(base_domain, stream)).await??;
     // let mut stream = connector.connect(base_domain, stream)?;
-    stream.write_all((base_url.to_string() + "\r\n").as_bytes()).await?;
+    timeout(TIMEOUT, stream.write_all((base_url.to_string() + "\r\n").as_bytes())).await??;
     let mut response = String::new();
-    stream.read_to_string(&mut response).await?; // TODO: check if response contains error
-                                           // Parse links in the response
+    // TODO: check if response contains error
+    timeout(TIMEOUT, stream.read_to_string(&mut response)).await??;
 
     use futures::stream::FuturesUnordered;
     use futures::prelude::*;
 
+    // Parse links in response
     let mut fs = response
         .lines()
         .filter_map(|line| {
@@ -130,7 +135,7 @@ async fn visit_url(base_url: Url, depth: usize) -> Result<Rc<RefCell<GeminiGraph
 }
 
 const BASE_URL: &str = "gemini://makeworld.space:1965/amfora-wiki/";
-const DEPTH: usize = 4;
+const DEPTH: usize = 5;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
