@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use petgraph::graph::{Graph, NodeIndex};
 use url::Url;
+use mime::Mime;
 // use serde::{Serialize, Deserialize};
 
 pub type GeminiGraph = Graph<String, usize>;
@@ -98,9 +99,10 @@ pub fn parse_body_urls(base_url: &Url, body: &str) -> Vec<Url> {
         .collect()
 }
 
-enum GeminiHeader {
+#[derive(Debug)]
+pub enum GeminiHeader {
     Input(String),
-    Success(String), // string is mime type
+    Success(Mime), // string is mime type
     Redirect(Url),
     TempFail(String),
     PermFail(String),
@@ -116,7 +118,7 @@ impl FromStr for GeminiHeader {
         use GeminiHeader::*;
         let header = match status_code {
             10..=19 => Input(rest),
-            20..=29 => Success(rest),
+            20..=29 => Success(rest.parse()?),
             30..=39 => Redirect(Url::parse(&rest)?),
             40..=49 => TempFail(rest),
             50..=59 => PermFail(rest),
