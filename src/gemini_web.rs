@@ -6,17 +6,29 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
-use petgraph::graph::{Graph, NodeIndex};
-use url::Url;
 use mime::Mime;
-// use serde::{Serialize, Deserialize};
+use petgraph::graph::{Graph, NodeIndex};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use url::Url;
 
 pub type GeminiGraph = Graph<String, usize>;
 
-// #[derive(Serialize, Deserialize)]
-#[derive(Default)]
+fn serialize_url<S: Serializer>(visited: &HashSet<Url>, serializer: S) -> Result<S::Ok, S::Error> {
+    let visited: HashSet<_> = visited.iter().map(|u| u.to_string()).collect();
+    visited.serialize(serializer)
+}
+
+fn deserialize_url<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HashSet<Url>, D::Error> {
+    let visited = HashSet::<String>::deserialize(deserializer)?;
+    // TODO: change unwrap to return the result (ParseError cannot be converted to serde error
+    // automatically)
+    Ok(visited.iter().map(|u| Url::parse(u).unwrap()).collect()) //::<Result<_, _>>();
+}
+
+#[derive(Default, Serialize, Deserialize)]
 pub struct GeminiWeb {
     graph: GeminiGraph,
+    #[serde(serialize_with = "serialize_url", deserialize_with = "deserialize_url")]
     visited: HashSet<Url>,
     url_node_ids: HashMap<String, NodeIndex>,
 }
@@ -102,7 +114,7 @@ pub fn parse_body_urls(base_url: &Url, body: &str) -> Vec<Url> {
 #[derive(Debug)]
 pub enum GeminiHeader {
     Input(String),
-    Success(Mime), // string is mime type
+    Success(Mime),
     Redirect(Url),
     TempFail(String),
     PermFail(String),

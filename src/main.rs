@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::error::Error;
+use std::fs::File;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use url::Url;
 
 pub mod gemini_web;
 
-use gemini_web::{GeminiWeb, GeminiHeader};
+use gemini_web::{GeminiHeader, GeminiWeb};
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_REDIRECT: usize = 256;
@@ -57,7 +58,7 @@ async fn gemini_get_recursion(url: &Url, redirect_count: usize) -> Result<String
         Redirect(url) => {
             eprintln!("Following redirect to {url}");
             gemini_get_recursion(&url, redirect_count + 1).await
-        },
+        }
         _ => Err(format!("invalid header type {header:?}").into()),
     }
 }
@@ -95,18 +96,18 @@ async fn visit_url_recursion(
 }
 
 async fn visit_url(base_url: Url, depth: usize) -> Result<GeminiWeb, Box<dyn Error>> {
-    // let graph = match File::open("graph.bincode") {
-    //     Ok(reader) => bincode::deserialize_from(reader)?,
-    //     _ => Graph::new(),
-    // };
-    let web = Rc::new(RefCell::new(GeminiWeb::new()));
+    let web = match File::open("web.bincode") {
+        Ok(reader) => bincode::deserialize_from(reader)?,
+        _ => GeminiWeb::new(),
+    };
+    let web = Rc::new(RefCell::new(web));
     let base_node_id = web.borrow_mut().add_node(&base_url);
     visit_url_recursion(base_url, base_node_id, web.clone(), depth).await?;
     Ok(web.take()) // FIXME: understand why into_inner() doesn't work here
 }
 
 const BASE_URL: &str = "gemini://makeworld.space:1965/amfora-wiki/";
-const DEPTH: usize = 5;
+const DEPTH: usize = 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -116,9 +117,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // println!("Node count: {}", graph.node_count());
     // println!("Edge count: {}", graph.edge_count());
 
-    // let graph_file = File::create("graph.bincode")?;
-    // bincode::serialize_into(graph_file, &graph)?;
+    let web_file = File::create("web.bincode")?;
+    bincode::serialize_into(web_file, &web)?;
 
-    // web.to_dot("svg")?;
+    web.to_dot("svg")?;
     Ok(())
 }
