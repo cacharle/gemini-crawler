@@ -3,34 +3,22 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
 use mime::Mime;
 use petgraph::graph::{Graph, NodeIndex};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub type GeminiGraph = Graph<String, usize>;
-
-fn serialize_url<S: Serializer>(visited: &HashSet<Url>, serializer: S) -> Result<S::Ok, S::Error> {
-    let visited: HashSet<_> = visited.iter().map(|u| u.to_string()).collect();
-    visited.serialize(serializer)
-}
-
-fn deserialize_url<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HashSet<Url>, D::Error> {
-    let visited = HashSet::<String>::deserialize(deserializer)?;
-    // TODO: change unwrap to return the result (ParseError cannot be converted to serde error
-    // automatically)
-    Ok(visited.iter().map(|u| Url::parse(u).unwrap()).collect()) //::<Result<_, _>>();
-}
+pub type GeminiGraph = Graph<Url, usize>;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct GeminiWeb {
     graph: GeminiGraph,
-    #[serde(serialize_with = "serialize_url", deserialize_with = "deserialize_url")]
     visited: HashSet<Url>,
-    url_node_ids: HashMap<String, NodeIndex>,
+    url_node_ids: HashMap<Url, NodeIndex>,
 }
 
 impl GeminiWeb {
@@ -43,12 +31,11 @@ impl GeminiWeb {
     }
 
     pub fn add_node(&mut self, url: &Url) -> NodeIndex {
-        let key = format!("{}{}", url.domain().unwrap(), url.path());
-        if let Some(index) = self.url_node_ids.get(&key) {
+        if let Some(index) = self.url_node_ids.get(&url) {
             return *index;
         }
-        let index = self.graph.add_node(key.clone());
-        self.url_node_ids.insert(key, index);
+        let index = self.graph.add_node(url.clone());
+        self.url_node_ids.insert(url.clone(), index);
         index
     }
 
@@ -70,23 +57,48 @@ impl GeminiWeb {
         !self.visited.insert(url.clone())
     }
 
-    pub fn to_dot(&self, file_type: &str) -> Result<(), Box<dyn Error>> {
+    pub fn unvisited(&self) -> Vec<Url> {
+        let registered_urls: HashSet<_> = self.url_node_ids.keys().cloned().collect();
+        registered_urls.difference(&self.visited).cloned().collect()
+    }
+
+    pub fn to_dot(&self, path: impl AsRef<Path>) -> Result<(), Box<dyn Error>> {
+        let path = path.as_ref();
+
         // Piping dot representation of graph to graphviz and writing the output to an image
         let mut dot_process = Command::new("dot")
-            .arg(format!("-T{file_type}"))
+            .arg(format!(
+                "-T{}",
+                path.extension()
+                    .ok_or("path doesn't have extension")?
+                    .to_str()
+                    .unwrap()
+            ))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
         let mut dot_process_stdin = dot_process.stdin.take().expect("Failed to get stdin");
         let graph = self.graph.clone(); // TODO: could be slow
         std::thread::spawn(move || {
-            let graph_dot = Dot::with_config(&graph, &[Config::EdgeNoLabel]);
+            let graph_dot = Dot::with_attr_getters(
+                &graph,
+                &[Config::EdgeNoLabel],
+                &|_, _| String::new(),
+                &|_, (_, url)| {
+                    format!(
+                        "label=\"{}{}\" group=\"{}\" fontname=\"monospace\"",
+                        url.domain().unwrap(),
+                        url.path(),
+                        url.domain().unwrap(),
+                    )
+                },
+            );
             dot_process_stdin
                 .write_all(format!("{:?}", graph_dot).as_bytes())
                 .expect("Counldn't write to stdin");
         });
         let output = dot_process.wait_with_output()?;
-        let mut dot_file = File::create("graph.svg")?;
+        let mut dot_file = File::create(path)?;
         dot_file.write_all(&output.stdout[..])?;
         Ok(())
     }
@@ -138,5 +150,111 @@ impl FromStr for GeminiHeader {
             _ => return Err("invalid status code".into()),
         };
         Ok(header)
+    }
+}
+
+#[derive(Debug)]
+pub struct GeminiResponse {
+    url: Url,
+    pub header: GeminiHeader,
+    pub body: GeminiText,
+}
+
+impl GeminiResponse {
+    pub fn new(response: &str, url: &Url) -> Result<GeminiResponse, Box<dyn Error>> {
+        let (header, body) = response
+            .split_once("\r\n")
+            .ok_or("Gemini response invalid format")?;
+        let header: GeminiHeader = header.parse()?;
+        let body = GeminiText::new(body, url)?;
+        Ok(GeminiResponse {
+            url: url.clone(),
+            header,
+            body,
+        })
+    }
+
+    pub fn gemini_urls(&self) -> Vec<Url> {
+        self.body
+            .0
+            .iter()
+            .filter_map(|s| match s {
+                GeminiTextStatement::Link(u, _) if u.scheme() == "gemini" => Some(u),
+                _ => None,
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct GeminiText(Vec<GeminiTextStatement>);
+
+#[derive(Debug)]
+enum GeminiTextStatement {
+    Line(String),
+    Link(Url, String),
+    ListItem(String),
+    Header(GeminiTextHeaderLevel, String),
+}
+
+#[derive(Debug)]
+enum GeminiTextHeaderLevel {
+    L1,
+    L2,
+    L3,
+}
+
+impl GeminiText {
+    fn new(body: &str, base_url: &Url) -> Result<GeminiText, Box<dyn Error>> {
+        let url_parser = Url::options().base_url(Some(base_url));
+        use GeminiTextHeaderLevel::*;
+        use GeminiTextStatement::*;
+        let mut in_pre = false;
+        let mut text: GeminiText = Default::default();
+        for line in body.lines() {
+            let line = line.trim().to_string();
+            if line == "```" {
+                in_pre = !in_pre;
+            }
+            if in_pre {
+                text.0.push(Line(line));
+                continue;
+            }
+            let statement = match line.as_bytes() {
+                [b'=', b'>', ..] => {
+                    let line = line[2..].trim().replace("\t", " ");
+                    let (url, label) = line.split_once(" ").unwrap_or((&line, ""));
+                    Link(url_parser.parse(url.trim())?, label.trim().to_string())
+                }
+                [b'#', b'#', b'#', ..] => Header(L3, line[3..].trim().to_string()),
+                [b'#', b'#', ..] => Header(L2, line[2..].trim().to_string()),
+                [b'#', ..] => Header(L1, line[1..].trim().to_string()),
+                [b'*', ..] => ListItem(line[1..].trim().to_string()),
+                _ => Line(line),
+            };
+            text.0.push(statement);
+        }
+        Ok(text)
+    }
+}
+
+use std::fmt;
+
+impl fmt::Display for GeminiText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use GeminiTextHeaderLevel::*;
+        use GeminiTextStatement::*;
+        self.0
+            .iter()
+            .map(|statement| match statement {
+                Line(s) => write!(f, "{}\n", s),
+                Link(url, label) => write!(f, "=> {} ({})\n", url.to_string(), label),
+                ListItem(s) => write!(f, "* {}\n", s),
+                Header(L1, s) => write!(f, "# {}\n", s),
+                Header(L2, s) => write!(f, "## {}\n", s),
+                Header(L3, s) => write!(f, "### {}\n", s),
+            })
+            .collect()
     }
 }
