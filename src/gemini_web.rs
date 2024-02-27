@@ -17,7 +17,7 @@ pub type GeminiGraph = Graph<Url, usize>;
 #[derive(Default, Serialize, Deserialize)]
 pub struct GeminiWeb {
     graph: GeminiGraph,
-    visited: HashSet<Url>,
+    pub visited: HashSet<Url>,
     url_node_ids: HashMap<Url, NodeIndex>,
     pub url_response: HashMap<Url, GeminiResponse>,
 }

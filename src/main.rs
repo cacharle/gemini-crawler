@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs::File;
 use std::rc::Rc;
 use std::time::Duration;
+use std::collections::VecDeque;
 
 use async_recursion::async_recursion;
 use futures::prelude::*;
@@ -19,10 +20,10 @@ pub mod gemini_web;
 
 use gemini_web::{GeminiHeader, GeminiResponse, GeminiWeb};
 
-const TIMEOUT: Duration = Duration::from_secs(2);
+const TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_REDIRECT: usize = 256;
 
-#[async_recursion(?Send)]
+#[async_recursion]
 async fn gemini_get_recursion(
     url: &Url,
     redirect_count: usize,
@@ -47,6 +48,8 @@ async fn gemini_get_recursion(
         stream.write_all((url.to_string() + "\r\n").as_bytes()),
     )
     .await??;
+    // TODO: parse header in a buf instead of trying to put the whole response in a string
+    // (some response contain binary data like images but still have a valid header)
     let mut response = String::new();
     timeout(TIMEOUT, stream.read_to_string(&mut response)).await??;
 
@@ -100,19 +103,51 @@ async fn visit_url_recursion(
     Ok(())
 }
 
+use tokio::sync::mpsc;
+const CHANNEL_LEN: usize = 10;
+
 async fn visit_url(
-    web: GeminiWeb,
+    mut web: GeminiWeb,
     base_url: Url,
-    depth: usize,
 ) -> Result<GeminiWeb, Box<dyn Error>> {
-    let web = Rc::new(RefCell::new(web));
-    let base_node_id = web.borrow_mut().add_node(&base_url);
-    visit_url_recursion(base_url, base_node_id, web.clone(), depth).await?;
-    Ok(web.take()) // FIXME: understand why into_inner() doesn't work here
+    // let web = Rc::new(RefCell::new(web));
+    let base_node_id = web.add_node(&base_url);
+    // visit_url_recursion(base_url, base_node_id, web.clone(), depth).await?;
+    // Ok(web.take()) // FIXME: understand why into_inner() doesn't work here
+
+    let (url_tx, mut url_rx) = mpsc::channel(CHANNEL_LEN);
+    let (response_tx, mut response_rx) = mpsc::channel(CHANNEL_LEN);
+    url_tx.send((base_url.clone(), base_node_id)).await?;
+
+    let _querier = tokio::spawn(async move {
+        while let Some((url, node_id)) = url_rx.recv().await {
+            eprintln!("Visiting {}", url);
+            let response = match gemini_get(&url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error gemini_get for {}: {}", url, e);
+                    continue;
+                }
+            };
+            response_tx.send((url, node_id, response)).await.unwrap();
+        }
+        drop(response_tx);
+    });
+
+    while let Some((url, node_id, response)) = response_rx.recv().await {
+        web.visited.insert(url.clone());
+        let urls = response.gemini_urls();
+        let urls: Vec<Url> = urls.iter().filter(|u| !web.visited.contains(u)).cloned().collect();
+        let node_ids = web.add_urls(node_id, &urls);
+        for (u, node_id) in urls.iter().zip(node_ids) {
+            url_tx.send_timeout((u.clone(), node_id), Duration::from_secs(1)).await.unwrap();
+        }
+    }
+
+    Ok(web)
 }
 
 const BASE_URL: &str = "gemini://makeworld.space/amfora-wiki/";
-const DEPTH: usize = 10;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -126,7 +161,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
     for unvisited_url in unvisited_urls {
         println!("Trying unvisited url: {}", unvisited_url);
-        web = visit_url(web, unvisited_url, DEPTH).await?;
+        web = visit_url(web, unvisited_url).await?;
     }
 
     // println!("Node count: {}", graph.node_count());
