@@ -9,7 +9,6 @@ use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use native_tls::TlsConnector;
 use petgraph::graph::NodeIndex;
-use tokio;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -76,14 +75,14 @@ async fn visit_url_recursion(
     depth: usize,
 ) -> Result<(), Box<dyn Error>> {
     // tokio::time::interval is annoying because putting it in a RefCell causes runtime crash
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     if depth == 0 || web.borrow_mut().try_visit(&base_url) {
         return Ok(());
     }
-    eprintln!("Visiting {}", base_url.to_string());
+    eprintln!("Visiting {}", base_url);
     let response = gemini_get(&base_url).await?;
-    println!("{}", response.body);
 
+    web.borrow_mut().url_response.insert(base_url.clone(), response.clone());
     let urls = response.gemini_urls();
     let node_ids = web.borrow_mut().add_urls(base_node_id, &urls);
 
@@ -113,7 +112,7 @@ async fn visit_url(
 }
 
 const BASE_URL: &str = "gemini://makeworld.space/amfora-wiki/";
-const DEPTH: usize = 3;
+const DEPTH: usize = 10;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -122,7 +121,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         _ => GeminiWeb::new(),
     };
     let mut unvisited_urls = web.unvisited();
-    if unvisited_urls.len() == 0 {
+    if unvisited_urls.is_empty() {
         unvisited_urls = vec![Url::parse(BASE_URL)?];
     }
     for unvisited_url in unvisited_urls {

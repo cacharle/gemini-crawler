@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use mime::Mime;
 use petgraph::graph::{Graph, NodeIndex};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use url::Url;
 
 pub type GeminiGraph = Graph<Url, usize>;
@@ -19,6 +19,7 @@ pub struct GeminiWeb {
     graph: GeminiGraph,
     visited: HashSet<Url>,
     url_node_ids: HashMap<Url, NodeIndex>,
+    pub url_response: HashMap<Url, GeminiResponse>,
 }
 
 impl GeminiWeb {
@@ -27,11 +28,12 @@ impl GeminiWeb {
             graph: Graph::new(),
             visited: HashSet::new(),
             url_node_ids: HashMap::new(),
+            url_response: HashMap::new(),
         }
     }
 
     pub fn add_node(&mut self, url: &Url) -> NodeIndex {
-        if let Some(index) = self.url_node_ids.get(&url) {
+        if let Some(index) = self.url_node_ids.get(url) {
             return *index;
         }
         let index = self.graph.add_node(url.clone());
@@ -39,10 +41,10 @@ impl GeminiWeb {
         index
     }
 
-    pub fn add_urls(&mut self, base_node_id: NodeIndex, urls: &Vec<Url>) -> Vec<NodeIndex> {
+    pub fn add_urls(&mut self, base_node_id: NodeIndex, urls: &[Url]) -> Vec<NodeIndex> {
         urls.iter()
             .map(|adjacent_url| {
-                let node_id = self.add_node(&adjacent_url);
+                let node_id = self.add_node(adjacent_url);
                 let edge_weight = match self.graph.find_edge(base_node_id, node_id) {
                     Some(e) => self.graph.edge_weight(e).unwrap() + 1,
                     None => 1,
@@ -107,8 +109,8 @@ impl GeminiWeb {
 pub fn parse_body_urls(base_url: &Url, body: &str) -> Vec<Url> {
     body.lines()
         .filter_map(|line| {
-            let line = line.strip_prefix("=>")?.trim().replace("\t", " ");
-            let (adjacent_url, _label) = line.split_once(" ").unwrap_or((&line, ""));
+            let line = line.strip_prefix("=>")?.trim().replace('\t', " ");
+            let (adjacent_url, _label) = line.split_once(' ').unwrap_or((&line, ""));
             match Url::parse(adjacent_url) {
                 Ok(url) => (url.scheme() == "gemini").then_some(url),
                 Err(url::ParseError::RelativeUrlWithoutBase) => {
@@ -123,9 +125,23 @@ pub fn parse_body_urls(base_url: &Url, body: &str) -> Vec<Url> {
         .collect()
 }
 
-#[derive(Debug)]
+fn serialize_mime<S: Serializer>(mime: &Mime, serializer: S) -> Result<S::Ok, S::Error> {
+    mime.to_string().serialize(serializer)
+}
+
+fn deserialize_mime<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Mime, D::Error> {
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum GeminiHeader {
     Input(String),
+    #[serde(
+        serialize_with = "serialize_mime",
+        deserialize_with = "deserialize_mime"
+    )]
     Success(Mime),
     Redirect(Url),
     TempFail(String),
@@ -136,7 +152,7 @@ pub enum GeminiHeader {
 impl FromStr for GeminiHeader {
     type Err = Box<dyn Error>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (status_code, rest) = s.split_once(" ").ok_or("no status code")?;
+        let (status_code, rest) = s.split_once(' ').ok_or("no status code")?;
         let status_code: u64 = status_code.parse()?;
         let rest = rest.to_string();
         use GeminiHeader::*;
@@ -153,7 +169,7 @@ impl FromStr for GeminiHeader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct GeminiResponse {
     url: Url,
     pub header: GeminiHeader,
@@ -187,10 +203,10 @@ impl GeminiResponse {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct GeminiText(Vec<GeminiTextStatement>);
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 enum GeminiTextStatement {
     Line(String),
     Link(Url, String),
@@ -198,7 +214,7 @@ enum GeminiTextStatement {
     Header(GeminiTextHeaderLevel, String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 enum GeminiTextHeaderLevel {
     L1,
     L2,
@@ -223,8 +239,8 @@ impl GeminiText {
             }
             let statement = match line.as_bytes() {
                 [b'=', b'>', ..] => {
-                    let line = line[2..].trim().replace("\t", " ");
-                    let (url, label) = line.split_once(" ").unwrap_or((&line, ""));
+                    let line = line[2..].trim().replace('\t', " ");
+                    let (url, label) = line.split_once(' ').unwrap_or((&line, ""));
                     Link(url_parser.parse(url.trim())?, label.trim().to_string())
                 }
                 [b'#', b'#', b'#', ..] => Header(L3, line[3..].trim().to_string()),
@@ -247,14 +263,13 @@ impl fmt::Display for GeminiText {
         use GeminiTextStatement::*;
         self.0
             .iter()
-            .map(|statement| match statement {
-                Line(s) => write!(f, "{}\n", s),
-                Link(url, label) => write!(f, "=> {} ({})\n", url.to_string(), label),
-                ListItem(s) => write!(f, "* {}\n", s),
-                Header(L1, s) => write!(f, "# {}\n", s),
-                Header(L2, s) => write!(f, "## {}\n", s),
-                Header(L3, s) => write!(f, "### {}\n", s),
+            .try_for_each(|statement| match statement {
+                Line(s) => writeln!(f, "{}", s),
+                Link(url, label) => writeln!(f, "=> {} ({})", url, label),
+                ListItem(s) => writeln!(f, "* {}", s),
+                Header(L1, s) => writeln!(f, "# {}", s),
+                Header(L2, s) => writeln!(f, "## {}", s),
+                Header(L3, s) => writeln!(f, "### {}", s),
             })
-            .collect()
     }
 }
