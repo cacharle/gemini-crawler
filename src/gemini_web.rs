@@ -152,7 +152,10 @@ pub enum GeminiHeader {
 impl FromStr for GeminiHeader {
     type Err = Box<dyn Error>;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (status_code, rest) = s.split_once(' ').ok_or("no status code")?;
+        let (status_code, rest) = s
+            .split_once(' ')
+            .or(s.split_once('\t'))
+            .ok_or("no status code")?;
         let status_code: u64 = status_code.parse()?;
         let rest = rest.to_string();
         use GeminiHeader::*;
@@ -177,12 +180,27 @@ pub struct GeminiResponse {
 }
 
 impl GeminiResponse {
-    pub fn new(response: &str, url: &Url) -> Result<GeminiResponse, Box<dyn Error>> {
-        let (header, body) = response
-            .split_once("\r\n")
-            .ok_or("Gemini response invalid format")?;
+    pub fn new(response_bytes: &[u8], url: &Url) -> Result<GeminiResponse, Box<dyn Error>> {
+        let mut header_bytes: Vec<u8> = Vec::new();
+        for window in response_bytes.windows(2) {
+            if let [b'\r', b'\n'] = window {
+                break;
+            }
+            if header_bytes.len() > 512 {
+                // Some server trigger this because they end the header with \n instead of \r\n
+                return Err("Gemini header too large".into());
+            }
+            header_bytes.push(window[0]);
+        }
+        let header = String::from_utf8(header_bytes.clone())?;
         let header: GeminiHeader = header.parse()?;
-        let body = GeminiText::new(body, url)?;
+        let body = match header {
+            GeminiHeader::Success(ref mime) if mime.essence_str() == "text/gemini" => {
+                let body = String::from_utf8(response_bytes[header_bytes.len() + 2..].to_vec())?;
+                GeminiText::new(&body, url)?
+            }
+            _ => GeminiText::default(),
+        };
         Ok(GeminiResponse {
             url: url.clone(),
             header,
@@ -261,15 +279,13 @@ impl fmt::Display for GeminiText {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use GeminiTextHeaderLevel::*;
         use GeminiTextStatement::*;
-        self.0
-            .iter()
-            .try_for_each(|statement| match statement {
-                Line(s) => writeln!(f, "{}", s),
-                Link(url, label) => writeln!(f, "=> {} ({})", url, label),
-                ListItem(s) => writeln!(f, "* {}", s),
-                Header(L1, s) => writeln!(f, "# {}", s),
-                Header(L2, s) => writeln!(f, "## {}", s),
-                Header(L3, s) => writeln!(f, "### {}", s),
-            })
+        self.0.iter().try_for_each(|statement| match statement {
+            Line(s) => writeln!(f, "{}", s),
+            Link(url, label) => writeln!(f, "=> {} ({})", url, label),
+            ListItem(s) => writeln!(f, "* {}", s),
+            Header(L1, s) => writeln!(f, "# {}", s),
+            Header(L2, s) => writeln!(f, "## {}", s),
+            Header(L3, s) => writeln!(f, "### {}", s),
+        })
     }
 }
