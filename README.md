@@ -1,4 +1,6 @@
+# Gemini Crawler
 
+Crawler for the [gemini][1] (minimalist alternative to HTTP) web.
 
 ## TODO
 
@@ -16,3 +18,5 @@
 - [ ] TLS verify to true
 - [ ] progress bar with nb visit/second (with error logs on top)
 - [ ] get keyword from page with https://github.com/guillaume-be/rust-bert (search keywords in readme)
+
+[1]: https://geminiprotocol.net/
